@@ -27,36 +27,28 @@ std::string bytesToHex(const std::vector<uint8_t>& bytes) {
     return ss.str();
 }
 
-
 DWORD sendRequest(const std::string& ciphertext_hex) {
     DWORD statusCode = 0;
     DWORD dwSize = sizeof(DWORD);
 
-    HINTERNET hSession = WinHttpOpen(L"Padding Oracle Attack/1.0", 
+    HINTERNET hSession = WinHttpOpen(L"Padding Oracle Attack/1.1", 
                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                     WINHTTP_NO_PROXY_NAME, 
-                                     WINHTTP_NO_PROXY_BYPASS, 0);
+                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return 0;
 
     HINTERNET hConnect = WinHttpConnect(hSession, L"crypto-class.appspot.com", 
                                         INTERNET_DEFAULT_HTTP_PORT, 0);
     if (hConnect) {
-
         std::string path_str = "/po?er=" + ciphertext_hex;
         std::wstring wpath(path_str.begin(), path_str.end());
-
 
         HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", wpath.c_str(), 
                                                 NULL, WINHTTP_NO_REFERER, 
                                                 WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
         if (hRequest) {
-
             if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, 
                                    WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-                
-         
                 if (WinHttpReceiveResponse(hRequest, NULL)) {
-                
                     WinHttpQueryHeaders(hRequest, 
                                         WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, 
                                         WINHTTP_HEADER_NAME_BY_INDEX, 
@@ -68,8 +60,16 @@ DWORD sendRequest(const std::string& ciphertext_hex) {
         WinHttpCloseHandle(hConnect);
     }
     WinHttpCloseHandle(hSession);
-    
     return statusCode;
+}
+
+DWORD sendRequestWithRetry(const std::string& ciphertext_hex) {
+    for (int retries = 0; retries < 3; ++retries) {
+        DWORD status = sendRequest(ciphertext_hex);
+        if (status != 0) return status;
+        Sleep(500); 
+    }
+    return 0;
 }
 
 int main() {
@@ -80,7 +80,7 @@ int main() {
     int num_blocks = ciphertext.size() / block_size;
     std::string decrypted_message = "";
 
-    std::cout << "[*] Starting Padding Oracle Attack on Windows..." << std::endl;
+    std::cout << "[*] Starting Resilient Padding Oracle Attack..." << std::endl;
 
     for (int block = 1; block < num_blocks; ++block) {
         std::vector<uint8_t> plaintext_block(block_size, 0);
@@ -105,9 +105,22 @@ int main() {
                     forged_ciphertext.push_back(ciphertext[block * block_size + i]);
                 }
 
-                DWORD status = sendRequest(bytesToHex(forged_ciphertext));
+
+                DWORD status = sendRequestWithRetry(bytesToHex(forged_ciphertext));
 
                 if (status == 404 || status == 200) {
+        
+                    if (byte_idx == block_size - 1) {
+                        std::vector<uint8_t> verify_ciphertext = forged_ciphertext;
+                  
+                        verify_ciphertext[block_size - 2] ^= 0xFF; 
+                        
+                        DWORD verify_status = sendRequestWithRetry(bytesToHex(verify_ciphertext));
+                        if (verify_status != 404 && verify_status != 200) {
+                            continue;
+                        }
+                    }
+
                     plaintext_block[byte_idx] = guess;
                     found = true;
                     std::cout << "[+] Found byte " << byte_idx << " of block " << block 
