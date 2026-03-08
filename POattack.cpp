@@ -73,68 +73,107 @@ DWORD sendRequestWithRetry(const std::string& ciphertext_hex) {
 }
 
 int main() {
+    // Ciphertext: 4 blocks of 16 bytes (Block 0 = IV, Blocks 1-3 = ciphertext)
     std::string target_hex = "f20bdba6ff29eed7b046d1df9fb7000058b1ffb4210a580f748b4ac714c001bd4a61044426fb515dad3f21f18aa577c0bdf302936266926ff37dbf7035d5eeb4";
     std::vector<uint8_t> ciphertext = hexToBytes(target_hex);
-    
-    int block_size = 16;
-    int num_blocks = ciphertext.size() / block_size;
+
+    const int BLOCK_SIZE = 16;
+    int num_blocks = (int)ciphertext.size() / BLOCK_SIZE;
     std::string decrypted_message = "";
 
-    std::cout << "[*] Starting Resilient Padding Oracle Attack..." << std::endl;
+    std::cout << "[*] Starting Padding Oracle Attack (" << num_blocks - 1
+              << " ciphertext blocks to decrypt)..." << std::endl;
 
+    // Decrypt each ciphertext block (block 1 .. num_blocks-1)
+    // using the previous block (or IV) as the forged prev-block
     for (int block = 1; block < num_blocks; ++block) {
-        std::vector<uint8_t> plaintext_block(block_size, 0);
-        
-        for (int byte_idx = block_size - 1; byte_idx >= 0; --byte_idx) {
-            uint8_t pad_value = block_size - byte_idx;
+        std::vector<uint8_t> plaintext_block(BLOCK_SIZE, 0);
+        std::cout << "\n[*] Decrypting block " << block << "..." << std::endl;
+
+        // Recover bytes from right to left: index 15 down to 0
+        for (int byte_idx = BLOCK_SIZE - 1; byte_idx >= (block == 1 ? 14 : 0); --byte_idx) {
+            // PKCS#7 target padding value for this position
+            uint8_t pad_value = (uint8_t)(BLOCK_SIZE - byte_idx);
             bool found = false;
 
             for (int guess = 0; guess <= 255; ++guess) {
-                std::vector<uint8_t> forged_ciphertext;
-                std::vector<uint8_t> prev_block(ciphertext.begin() + (block - 1) * block_size, 
-                                                ciphertext.begin() + block * block_size);
-                
-                for (int k = block_size - 1; k > byte_idx; --k) {
-                    prev_block[k] = prev_block[k] ^ plaintext_block[k] ^ pad_value;
+                // Start from the real previous block (block-1)
+                std::vector<uint8_t> prev_block(
+                    ciphertext.begin() + (block - 1) * BLOCK_SIZE,
+                    ciphertext.begin() +  block      * BLOCK_SIZE);
+
+                // Fix up bytes we've already recovered so they decrypt to pad_value
+                for (int k = byte_idx + 1; k < BLOCK_SIZE; ++k) {
+                    prev_block[k] ^= plaintext_block[k] ^ pad_value;
                 }
 
-                prev_block[byte_idx] = prev_block[byte_idx] ^ guess ^ pad_value;
+                // Inject our guess for position byte_idx
+                prev_block[byte_idx] ^= guess ^ pad_value;
 
-                for (uint8_t b : prev_block) forged_ciphertext.push_back(b);
-                for (int i = 0; i < block_size; ++i) {
-                    forged_ciphertext.push_back(ciphertext[block * block_size + i]);
-                }
+                // Forged ciphertext = [modified prev block] + [current cipher block]
+                std::vector<uint8_t> forged;
+                forged.insert(forged.end(), prev_block.begin(), prev_block.end());
+                forged.insert(forged.end(),
+                              ciphertext.begin() + block * BLOCK_SIZE,
+                              ciphertext.begin() + block * BLOCK_SIZE + BLOCK_SIZE);
 
+                DWORD status = sendRequestWithRetry(bytesToHex(forged));
 
-                DWORD status = sendRequestWithRetry(bytesToHex(forged_ciphertext));
-
+                // 404 = valid PKCS#7 padding but bad message  --> oracle says "good padding"
+                // 403 = bad PKCS#7 padding                    --> try next guess
+                // 200 = valid padding and valid message (rare) --> also good
                 if (status == 404 || status == 200) {
-        
-                    if (byte_idx == block_size - 1) {
-                        std::vector<uint8_t> verify_ciphertext = forged_ciphertext;
-                  
-                        verify_ciphertext[block_size - 2] ^= 0xFF; 
-                        
-                        DWORD verify_status = sendRequestWithRetry(bytesToHex(verify_ciphertext));
-                        if (verify_status != 404 && verify_status != 200) {
-                            continue;
-                        }
+                    std::cout << "  [CANDIDATE] Block " << block << " byte " << byte_idx 
+                              << " guess=" << guess << " status=" << status << std::endl;
+                    // For the last byte, guard against a false positive where a longer
+                    // padding sequence (e.g. \x02\x02) accidentally validates.
+                    if (byte_idx == BLOCK_SIZE - 1) {
+                        // Flip the byte just before and re-check
+                        prev_block[byte_idx - 1] ^= 0xFF;
+                        std::vector<uint8_t> verify;
+                        verify.insert(verify.end(), prev_block.begin(), prev_block.end());
+                        verify.insert(verify.end(),
+                                      ciphertext.begin() + block * BLOCK_SIZE,
+                                      ciphertext.begin() + block * BLOCK_SIZE + BLOCK_SIZE);
+                        DWORD vstatus = sendRequestWithRetry(bytesToHex(verify));
+                        std::cout << "  [VERIFY] vstatus=" << vstatus << std::endl;
+                        if (vstatus == 403) continue; // false positive — keep searching
                     }
 
                     plaintext_block[byte_idx] = guess;
                     found = true;
-                    std::cout << "[+] Found byte " << byte_idx << " of block " << block 
-                              << ": " << (char)guess << " (0x" << std::hex << guess << std::dec << ")" << std::endl;
+                    char ch = (guess >= 32 && guess <= 126) ? (char)guess : '.';
+                    std::cout << "[+] Block " << block << " byte " << std::setw(2) << byte_idx
+                              << ": '" << ch << "' (0x" << std::hex << std::setw(2)
+                              << std::setfill('0') << (int)guess << std::dec
+                              << std::setfill(' ') << ")" << std::endl;
                     break;
                 }
             }
+
             if (!found) {
-                std::cout << "[-] Failed to find byte " << byte_idx << std::endl;
+                std::cout << "[-] Failed to find block " << block
+                          << " byte " << byte_idx << std::endl;
             }
         }
-        
-        for (uint8_t p : plaintext_block) {
-            decrypted_message += (char)p;
+
+        // Append decrypted block (strip PKCS#7 padding only on the very last block)
+        for (int i = 0; i < BLOCK_SIZE; ++i) {
+            decrypted_message += (char)plaintext_block[i];
+        }
+    }
+
+    // Strip PKCS#7 padding from the end
+    if (!decrypted_message.empty()) {
+        uint8_t pad = (uint8_t)decrypted_message.back();
+        if (pad >= 1 && pad <= BLOCK_SIZE) {
+            bool valid_pad = true;
+            for (int i = 0; i < pad; ++i) {
+                if ((uint8_t)decrypted_message[decrypted_message.size() - 1 - i] != pad) {
+                    valid_pad = false; break;
+                }
+            }
+            if (valid_pad) decrypted_message.erase(decrypted_message.size() - pad);
         }
     }
 
